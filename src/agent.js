@@ -1,4 +1,8 @@
+const Anthropic = require("@anthropic-ai/sdk");
 const { listProperties, getProperty } = require("./properties");
+
+const MODEL = "claude-opus-5-5";
+const MAX_ITERATIONS = 8;
 
 const SYSTEM_PROMPT = `Eres un asesor inmobiliario. Ayudas al usuario a elegir la propiedad que más le conviene del catálogo.
 
@@ -9,70 +13,82 @@ Cómo trabajar:
 - Usa únicamente datos del catálogo. Si algo no aparece, dilo; no inventes propiedades ni características.
 - Responde en el idioma del usuario, de forma breve y clara.`;
 
-// El Agent SDK es ESM-only; se importa dinámicamente desde CommonJS.
-const sdkPromise = import("@anthropic-ai/claude-agent-sdk");
-const zodPromise = import("zod");
+// Lee ANTHROPIC_API_KEY del entorno.
+const client = new Anthropic();
 
-const MCP_SERVER_NAME = "properties";
-const ALLOWED_TOOLS = [
-  `mcp__${MCP_SERVER_NAME}__list_properties`,
-  `mcp__${MCP_SERVER_NAME}__get_property`,
+const TOOLS = [
+  {
+    name: "list_properties",
+    description:
+      "Lista todas las propiedades del catálogo con id, título, tipo, precio en COP, zona, estrato, alcobas, baños, m2 y parqueaderos.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "get_property",
+    description:
+      "Devuelve la ficha completa (características, administración, entorno) de una propiedad por su id.",
+    input_schema: {
+      type: "object",
+      properties: {
+        id: {
+          type: "string",
+          description: "Id de la propiedad, tal como aparece en list_properties",
+        },
+      },
+      required: ["id"],
+    },
+  },
 ];
 
-const text = (value) => ({ content: [{ type: "text", text: value }] });
+const TOOL_HANDLERS = {
+  list_properties: async () => JSON.stringify(await listProperties(), null, 2),
+  get_property: async ({ id }) =>
+    (await getProperty(id)) ?? `No existe una propiedad con id "${id}".`,
+};
 
-async function buildPropertiesServer() {
-  const { tool, createSdkMcpServer } = await sdkPromise;
-  const { z } = await zodPromise;
-
-  return createSdkMcpServer({
-    name: MCP_SERVER_NAME,
-    tools: [
-      tool(
-        "list_properties",
-        "Lista todas las propiedades del catálogo con id, título, tipo, precio en COP, zona, estrato, alcobas, baños, m2 y parqueaderos.",
-        {},
-        async () => text(JSON.stringify(await listProperties(), null, 2)),
-      ),
-      tool(
-        "get_property",
-        "Devuelve la ficha completa (características, administración, entorno) de una propiedad por su id.",
-        { id: z.string().describe("Id de la propiedad, tal como aparece en list_properties") },
-        async ({ id }) => {
-          const property = await getProperty(id);
-          return property
-            ? text(property)
-            : { ...text(`No existe una propiedad con id "${id}".`), isError: true };
-        },
-      ),
-    ],
-  });
+async function runTool({ id, name, input }) {
+  const handler = TOOL_HANDLERS[name];
+  if (!handler) {
+    return { type: "tool_result", tool_use_id: id, content: `Tool desconocida: ${name}`, is_error: true };
+  }
+  try {
+    return { type: "tool_result", tool_use_id: id, content: await handler(input) };
+  } catch (err) {
+    return { type: "tool_result", tool_use_id: id, content: String(err.message), is_error: true };
+  }
 }
 
-const serverPromise = buildPropertiesServer();
+// `messages` es el historial completo [{ role, content }]; la API no guarda estado.
+async function runAgent({ messages }) {
+  const history = [...messages];
 
-async function runAgent({ message, sessionId }) {
-  const { query } = await sdkPromise;
+  for (let i = 0; i < MAX_ITERATIONS; i++) {
+    const response = await client.messages.create({
+      model: MODEL,
+      max_tokens: 16000,
+      system: SYSTEM_PROMPT,
+      tools: TOOLS,
+      messages: history,
+    });
 
-  let result;
-  for await (const msg of query({
-    prompt: message,
-    options: {
-      systemPrompt: SYSTEM_PROMPT,
-      tools: [], // sin herramientas integradas
-      mcpServers: { [MCP_SERVER_NAME]: await serverPromise },
-      allowedTools: ALLOWED_TOOLS, // auto-aprobadas, sin pedir confirmación
-      maxTurns: 5,
-      ...(sessionId && { resume: sessionId }),
-    },
-  })) {
-    if (msg.type === "result") result = msg;
+    if (response.stop_reason === "end_turn") {
+      const reply = response.content
+        .filter((block) => block.type === "text")
+        .map((block) => block.text)
+        .join("");
+      return { reply };
+    }
+    if (response.stop_reason !== "tool_use") {
+      throw new Error(`agent stopped: ${response.stop_reason}`);
+    }
+
+    // Se devuelve response.content completo (incluye los bloques de thinking, que deben volver intactos).
+    history.push({ role: "assistant", content: response.content });
+    const toolUses = response.content.filter((block) => block.type === "tool_use");
+    history.push({ role: "user", content: await Promise.all(toolUses.map(runTool)) });
   }
 
-  if (!result || result.subtype !== "success") {
-    throw new Error(`agent run failed: ${result?.subtype ?? "no result"}`);
-  }
-  return { reply: result.result, sessionId: result.session_id };
+  throw new Error("agent exceeded max iterations");
 }
 
 module.exports = { runAgent };

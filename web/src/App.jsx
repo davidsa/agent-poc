@@ -4,7 +4,6 @@ import remarkGfm from 'remark-gfm'
 
 export default function App() {
   const [messages, setMessages] = useState([])
-  const [sessionId, setSessionId] = useState(null)
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -29,11 +28,10 @@ export default function App() {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text, sessionId }),
+        body: JSON.stringify({ messages: next }),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error ?? 'Error del servidor')
-      setSessionId(data.sessionId)
       setMessages([...next, { role: 'assistant', content: data.reply }])
     } catch (err) {
       setError(err.message)
@@ -48,7 +46,6 @@ export default function App() {
 
   function reset() {
     setMessages([])
-    setSessionId(null)
     setError(null)
   }
 
