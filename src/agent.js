@@ -1,7 +1,7 @@
 const Anthropic = require("@anthropic-ai/sdk");
 const { listProperties, getProperty } = require("./properties");
 
-const MODEL = "claude-opus-5-5";
+const MODEL = "claude-haiku-5-5";
 const MAX_ITERATIONS = 8;
 
 const SYSTEM_PROMPT = `Eres un asesor inmobiliario. Ayudas al usuario a elegir la propiedad que más le conviene del catálogo.
